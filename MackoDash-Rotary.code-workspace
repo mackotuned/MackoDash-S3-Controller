@@ -1,0 +1,18 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        "C_Cpp.default.configurationProvider": "espressif.esp-idf-extension",
+        "idf.currentSetup": "C:/Users/mackb/esp/v5.5/esp-idf",
+        "idf.projectDir": "${workspaceFolder}",
+        "idf.portWin": "COM5",
+        "idf.flashType": "UART",
+        "idf.customExtraVars": {
+            "IDF_PYTHON_ENV_PATH": "C:/Users/mackb/.espressif/python_env/idf5.5_py3.11_env",
+            "IDF_TARGET": "esp32s3"
+        }
+    }
+}
