@@ -23,11 +23,13 @@ typedef enum {
     ROTARY_PING = 0x03,
     ROTARY_CAPTURE_CONTROL = 0x10,
     ROTARY_AIR_RIDE_COMMAND = 0x11,
+    ROTARY_HVAC_COMMAND = 0x12,
     ROTARY_STATE = 0x81,
     ROTARY_PONG = 0x83,
     ROTARY_CAPTURE_CHUNK = 0x90,
     ROTARY_CAPTURE_STATUS = 0x91,
     ROTARY_AIR_RIDE_STATE = 0x92,
+    ROTARY_HVAC_STATE = 0x93,
 } rotary_message_type_t;
 
 typedef enum {

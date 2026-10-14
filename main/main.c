@@ -23,6 +23,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "honda_emblem.h"
+#include "hvac_bridge.h"
 #include "nvs_flash.h"
 #include "rotary_protocol.h"
 #include "ruin_air_bridge.h"
@@ -75,10 +76,15 @@ typedef enum {
 
 typedef enum {
     CLIMATE_FAN = 0,
-    CLIMATE_TEMP,
     CLIMATE_MODE,
+    CLIMATE_TEMP,
     CLIMATE_CONTROL_COUNT,
 } climate_control_t;
+
+typedef enum {
+    CLIMATE_BROWSE = 0,
+    CLIMATE_ADJUST,
+} climate_controller_mode_t;
 
 typedef enum {
     AIR_CONTROLLER_BROWSE = 0,
@@ -137,15 +143,17 @@ static const char *const CONTROLLER_PAGE_LABELS[] = {
     "VIEW", "BRIGHT", "REC", "TRIP", "PEAKS", "SHIFT", "LOGS",
 };
 
-static const char *const CLIMATE_LABELS[] = {"FAN", "TEMP", "MODE"};
+static const char *const CLIMATE_LABELS[] = {"FAN", "BLEND", "TEMP"};
 static const char *const CLIMATE_FAN_VALUES[] = {"OFF", "1", "2", "3", "4"};
-static const char *const CLIMATE_TEMP_VALUES[] = {
-    "COLD", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "HOT",
-};
 static const char *const CLIMATE_MODE_VALUES[] = {
-    "FACE", "FACE/FEET", "FEET", "FEET/DEF", "DEFROST",
+    "FACE", "BI-LEVEL", "FLOOR", "MIX", "DEFROST",
 };
-static const int CLIMATE_VALUE_COUNTS[] = {5, 11, 5};
+static const char *const CLIMATE_TEMP_VALUES[] = {
+    "COLD", "COOL", "NEUTRAL", "WARM", "HOT",
+};
+static const uint8_t CLIMATE_FAN_NATIVE[] = {0, 2, 4, 7, 10};
+static const uint8_t CLIMATE_TEMP_NATIVE[] = {0, 4, 7, 10, 14};
+static const int CLIMATE_VALUE_COUNTS[] = {5, 5, 5};
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static SemaphoreHandle_t s_lcd_done;
 static SemaphoreHandle_t s_uart_tx_mutex;
@@ -154,7 +162,9 @@ static QueueHandle_t s_capture_queue;
 static uint16_t *s_framebuffer;
 static controller_state_t s_state = {.page = PAGE_HOME, .count = HOME_ITEM_COUNT};
 static int s_home_selection;
-static int s_climate_values[CLIMATE_CONTROL_COUNT] = {0, 5, 0};
+static int s_climate_values[CLIMATE_CONTROL_COUNT] = {0, 0, 2};
+static climate_controller_mode_t s_climate_mode;
+static hvac_bridge_state_t s_hvac_state;
 static air_controller_mode_t s_air_mode;
 static int s_air_action;
 static int64_t s_air_action_until;
@@ -170,6 +180,37 @@ static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static const uint8_t RUIN_REMOTE_MAC[6] = {0xf4, 0x65, 0x0b, 0xa9, 0xdd, 0xc5};
 static const uint8_t RUIN_CONTROLLER_MAC[6] = {0xec, 0xe3, 0x34, 0x88, 0x96, 0xe0};
+
+static void send_frame(rotary_message_type_t type, const uint8_t *payload, uint16_t length);
+
+static void send_hvac_uart_state(void)
+{
+    uint8_t payload[9];
+    portENTER_CRITICAL(&s_state_lock);
+    payload[0] = s_hvac_state.connected ? 1 : 0;
+    payload[1] = s_hvac_state.fan;
+    payload[2] = s_hvac_state.mode;
+    payload[3] = s_hvac_state.temp;
+    payload[4] = s_hvac_state.target_fan;
+    payload[5] = s_hvac_state.target_mode;
+    payload[6] = s_hvac_state.target_temp;
+    payload[7] = s_hvac_state.moving_mask;
+    payload[8] = s_hvac_state.fault_flags;
+    portEXIT_CRITICAL(&s_state_lock);
+    send_frame(ROTARY_HVAC_STATE, payload, sizeof(payload));
+}
+
+static void hvac_state_changed(const hvac_bridge_state_t *state, void *context)
+{
+    (void)context;
+    portENTER_CRITICAL(&s_state_lock);
+    s_hvac_state = *state;
+    portEXIT_CRITICAL(&s_state_lock);
+    send_hvac_uart_state();
+    ESP_LOGI(TAG, "HVAC %s fan=%u mode=%u temp=%u faults=0x%02x",
+             state->connected ? "online" : "offline", state->fan,
+             state->mode, state->temp, state->fault_flags);
+}
 
 static void encoder_edge_isr(void *argument)
 {
@@ -426,6 +467,38 @@ static void draw_icon(int item, int center_x, int center_y,
     }
 }
 
+static void draw_climate_icon(int control, int center_x, int center_y,
+                              uint16_t primary, uint16_t accent)
+{
+    if (control == CLIMATE_FAN) {
+        ring(center_x, center_y, 5, 5, accent);
+        for (int blade = 0; blade < 4; ++blade) {
+            float angle = blade * 3.14159265f / 2.0f;
+            int x = center_x + (int)lroundf(cosf(angle) * 13);
+            int y = center_y + (int)lroundf(sinf(angle) * 13);
+            ring(x, y, 8, 5, primary);
+        }
+        ring(center_x, center_y, 25, 2, accent);
+    } else if (control == CLIMATE_MODE) {
+        arc(center_x, center_y + 8, 23, 200, 340, 3, primary);
+        line(center_x - 22, center_y + 10, center_x + 22, center_y + 10, 3, primary);
+        for (int offset = -12; offset <= 12; offset += 12) {
+            line(center_x + offset, center_y + 4, center_x + offset - 5,
+                 center_y - 14, 2, accent);
+            line(center_x + offset - 5, center_y - 14, center_x + offset - 10,
+                 center_y - 8, 2, accent);
+        }
+    } else {
+        ring(center_x, center_y + 15, 10, 10, accent);
+        outline_rect(center_x - 5, center_y - 23, 10, 38, 3, primary);
+        fill_rect(center_x - 2, center_y - 9, 4, 26, accent);
+        for (int offset = -14; offset <= 2; offset += 8) {
+            line(center_x + 8, center_y + offset, center_x + 15,
+                 center_y + offset, 2, primary);
+        }
+    }
+}
+
 static bool air_target_includes_bag(int target, int bag)
 {
     if (target == AIR_TARGET_ALL_UP || target == AIR_TARGET_ALL_DOWN) return true;
@@ -529,27 +602,37 @@ static void render(void)
         }
     } else if (state.page == PAGE_CLIMATE) {
         int active = state.selection;
-        draw_gauge_scale(s_climate_values[active], CLIMATE_VALUE_COUNTS[active],
-                         white, line_color, red);
         fill_rect(96, 29, 48, 2, red);
         centered_text(39, "CLIMATE", 2, red);
-
-        for (int control = 0; control < CLIMATE_CONTROL_COUNT; ++control) {
-            int y = 67 + control * 39;
-            bool selected = control == active;
-            if (selected) {
-                fill_rect(35, y - 7, 170, 29, panel);
-                fill_rect(35, y - 7, 4, 29, red);
+        if (s_climate_mode == CLIMATE_BROWSE) {
+            for (int control = 0; control < CLIMATE_CONTROL_COUNT; ++control) {
+                int x = 13 + control * 73;
+                bool selected = control == active;
+                fill_rect(x, 66, 68, 105, selected ? panel : background);
+                outline_rect(x, 66, 68, 105, selected ? 3 : 1,
+                             selected ? red : line_color);
+                draw_climate_icon(control, x + 34, 96,
+                                  selected ? white : muted, red);
+                text_at(x + (68 - text_width(CLIMATE_LABELS[control], 1)) / 2,
+                        127, CLIMATE_LABELS[control], 1, selected ? red : muted);
+                const char *value = climate_value_label(control);
+                text_at(x + (68 - text_width(value, 1)) / 2, 148, value, 1, white);
             }
-            text_at(47, y, CLIMATE_LABELS[control], 1, selected ? red : muted);
-            const char *value = climate_value_label(control);
-            text_at(193 - text_width(value, 1), y, value, 1, white);
+            centered_text(188, "ROTATE TO SELECT", 1, muted);
+            centered_text(204, "PRESS TO ADJUST", 1, white);
+        } else {
+            draw_climate_icon(active, 120, 91, white, red);
+            centered_text(126, CLIMATE_LABELS[active], 1, red);
+            centered_text(145, climate_value_label(active), 2, white);
+            int count = CLIMATE_VALUE_COUNTS[active];
+            int width = count * 22 - 4;
+            for (int index = 0; index < count; ++index) {
+                fill_rect((LCD_WIDTH - width) / 2 + index * 22, 176, 18, 6,
+                          index <= s_climate_values[active] ? red : line_color);
+            }
+            centered_text(198, "PRESS WHEN DONE", 1, muted);
         }
-
-        centered_text(181, "PRESS TO SELECT", 1, muted);
-        outline_rect(84, 194, 72, 24, 2, line_color);
-        fill_rect(84, 194, 5, 24, red);
-        centered_text(202, "BACK", 1, white);
+        centered_text(218, "HOLD FOR HOME", 1, muted);
     } else if (state.page == PAGE_AIR_RIDE) {
         static const char *const targets[AIR_TARGET_COUNT] = {
             "ALL UP", "ALL DOWN", "FRONT LEFT", "FRONT RIGHT",
@@ -995,32 +1078,57 @@ static void air_press(void)
 static void climate_open(void)
 {
     portENTER_CRITICAL(&s_state_lock);
+    s_climate_mode = CLIMATE_BROWSE;
     s_state = (controller_state_t) {
         .page = PAGE_CLIMATE,
         .selection = CLIMATE_FAN,
         .count = CLIMATE_CONTROL_COUNT,
     };
     portEXIT_CRITICAL(&s_state_lock);
+    send_event(ROTARY_OPEN, PAGE_CLIMATE);
+}
+
+static void climate_apply(void)
+{
+    portENTER_CRITICAL(&s_state_lock);
+    uint8_t fan = CLIMATE_FAN_NATIVE[s_climate_values[CLIMATE_FAN]];
+    uint8_t mode = (uint8_t)s_climate_values[CLIMATE_MODE];
+    uint8_t temp = CLIMATE_TEMP_NATIVE[s_climate_values[CLIMATE_TEMP]];
+    s_hvac_state.target_fan = fan;
+    s_hvac_state.target_mode = mode;
+    s_hvac_state.target_temp = temp;
+    portEXIT_CRITICAL(&s_state_lock);
+    esp_err_t error = hvac_bridge_set(fan, mode, temp);
+    if (error != ESP_OK) ESP_LOGW(TAG, "HVAC command failed: %s", esp_err_to_name(error));
+    send_hvac_uart_state();
 }
 
 static void climate_rotate(int direction)
 {
     portENTER_CRITICAL(&s_state_lock);
     int control = s_state.selection;
-    int value = s_climate_values[control] + direction;
-    if (value < 0) value = 0;
-    if (value >= CLIMATE_VALUE_COUNTS[control]) value = CLIMATE_VALUE_COUNTS[control] - 1;
-    s_climate_values[control] = value;
+    if (s_climate_mode == CLIMATE_BROWSE) {
+        s_state.selection = (control + direction + CLIMATE_CONTROL_COUNT) %
+                            CLIMATE_CONTROL_COUNT;
+    } else {
+        int value = s_climate_values[control] + direction;
+        if (value < 0) value = 0;
+        if (value >= CLIMATE_VALUE_COUNTS[control]) value = CLIMATE_VALUE_COUNTS[control] - 1;
+        s_climate_values[control] = value;
+    }
+    climate_controller_mode_t mode = s_climate_mode;
     portEXIT_CRITICAL(&s_state_lock);
-    ESP_LOGI(TAG, "Climate preview: %s %s", CLIMATE_LABELS[control],
-             climate_value_label(control));
+    send_event(ROTARY_ROTATE, direction);
+    if (mode == CLIMATE_ADJUST) climate_apply();
 }
 
-static void climate_select_next(void)
+static void climate_press(void)
 {
     portENTER_CRITICAL(&s_state_lock);
-    s_state.selection = (s_state.selection + 1) % CLIMATE_CONTROL_COUNT;
+    s_climate_mode = s_climate_mode == CLIMATE_BROWSE ?
+                     CLIMATE_ADJUST : CLIMATE_BROWSE;
     portEXIT_CRITICAL(&s_state_lock);
+    send_event(ROTARY_PRESS, 0);
 }
 
 static void apply_frame(const uint8_t *frame, size_t frame_length)
@@ -1049,6 +1157,18 @@ static void apply_frame(const uint8_t *frame, size_t frame_length)
             if (error != ESP_OK) ESP_LOGE(TAG, "Air Ride command failed: %s",
                                           esp_err_to_name(error));
         }
+        return;
+    }
+    if (frame[3] == ROTARY_HVAC_COMMAND) {
+        const uint8_t *payload = &frame[ROTARY_HEADER_SIZE];
+        if (payload_length != 3 || payload[0] > 4 || payload[1] > 4 ||
+            payload[2] > 4) return;
+        portENTER_CRITICAL(&s_state_lock);
+        s_climate_values[CLIMATE_FAN] = payload[0];
+        s_climate_values[CLIMATE_MODE] = payload[1];
+        s_climate_values[CLIMATE_TEMP] = payload[2];
+        portEXIT_CRITICAL(&s_state_lock);
+        climate_apply();
         return;
     }
     if (frame[3] != ROTARY_STATE && frame[3] != ROTARY_PONG) return;
@@ -1167,7 +1287,11 @@ static void input_task(void *argument)
                 show_home();
                 send_event(ROTARY_LONG_PRESS, 0);
             }
-            else if (!home && !climate) send_event(ROTARY_LONG_PRESS, 0);
+            else if (climate) {
+                show_home();
+                send_event(ROTARY_LONG_PRESS, 0);
+            }
+            else if (!home) send_event(ROTARY_LONG_PRESS, 0);
             long_sent = true;
         } else if (!button_down && button_was_down && !button_woke_screen &&
                     !long_sent && now - button_down_at > 25000 &&
@@ -1186,7 +1310,7 @@ static void input_task(void *argument)
                 continue;
             }
             if (climate) {
-                climate_select_next();
+                climate_press();
                 button_was_down = button_down;
                 vTaskDelay(1);
                 continue;
@@ -1260,7 +1384,7 @@ static void touch_task(void *argument)
                     send_event(ROTARY_LONG_PRESS, 0);
                 } else {
                     if (climate || !link_connected()) show_home();
-                    if (!climate) send_event(ROTARY_BACK, 0);
+                    send_event(ROTARY_BACK, 0);
                 }
             }
         }
@@ -1357,6 +1481,10 @@ void app_main(void)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_promiscuous(true));
     } else {
         ESP_LOGE(TAG, "Ruin Air bridge init failed: %s", esp_err_to_name(ruin_error));
+    }
+    esp_err_t hvac_error = hvac_bridge_init(hvac_state_changed, NULL);
+    if (hvac_error != ESP_OK) {
+        ESP_LOGE(TAG, "HVAC bridge init failed: %s", esp_err_to_name(hvac_error));
     }
     s_last_activity = esp_timer_get_time();
     ESP_LOGI(TAG, "MackoDash rotary controller started");

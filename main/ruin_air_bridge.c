@@ -19,6 +19,8 @@
 #define RUIN_MAX_PAYLOAD 32
 #define RUIN_TELEMETRY_TIMEOUT_US 1000000LL
 #define RUIN_RELEASE_DELAY_US 250000
+#define RUIN_RELEASE_RETRY_INTERVAL_US 50000
+#define RUIN_RELEASE_ATTEMPTS 4
 #define RUIN_AIR_OUT_DELAY_US 10000000
 
 static const char *TAG = "ruin_air";
@@ -42,6 +44,7 @@ static ruin_air_state_t s_state;
 static uint8_t s_controller_mac[6];
 static uint16_t s_tx_sequence_control;
 static int64_t s_last_telemetry_us;
+static uint8_t s_release_attempts_remaining;
 static bool s_initialized;
 static bool s_controller_peer_added;
 
@@ -121,11 +124,32 @@ static esp_err_t send_release(void)
     return send_v1_frame(s_controller_mac, payload, sizeof(payload));
 }
 
+static esp_err_t schedule_release(int64_t delay_us)
+{
+    esp_err_t error = esp_timer_stop(s_release_timer);
+    if (error != ESP_OK && error != ESP_ERR_INVALID_STATE) return error;
+    s_release_attempts_remaining = RUIN_RELEASE_ATTEMPTS;
+    error = esp_timer_start_once(s_release_timer, delay_us);
+    if (error != ESP_OK) {
+        s_release_attempts_remaining = 0;
+        send_release();
+    }
+    return error;
+}
+
 static void release_timer_callback(void *argument)
 {
     (void)argument;
     esp_err_t error = send_release();
     if (error != ESP_OK) ESP_LOGE(TAG, "Release send failed: %s", esp_err_to_name(error));
+    if (s_release_attempts_remaining > 0) --s_release_attempts_remaining;
+    if (s_release_attempts_remaining > 0) {
+        error = esp_timer_start_once(s_release_timer, RUIN_RELEASE_RETRY_INTERVAL_US);
+        if (error != ESP_OK) {
+            s_release_attempts_remaining = 0;
+            ESP_LOGE(TAG, "Release retry schedule failed: %s", esp_err_to_name(error));
+        }
+    }
 }
 
 void ruin_air_bridge_ingest_frame(const uint8_t *frame, size_t length)
@@ -190,8 +214,11 @@ static void bridge_task(void *argument)
         }
         if (s_state.connected &&
             esp_timer_get_time() - s_last_telemetry_us > RUIN_TELEMETRY_TIMEOUT_US) {
-            esp_timer_stop(s_release_timer);
-            send_release();
+            esp_err_t release_error = schedule_release(1);
+            if (release_error != ESP_OK) {
+                ESP_LOGE(TAG, "Timeout release schedule failed: %s",
+                         esp_err_to_name(release_error));
+            }
             memset(&s_state, 0, sizeof(s_state));
             publish_state();
             ESP_LOGW(TAG, "Ruin telemetry timed out");
@@ -251,6 +278,10 @@ esp_err_t ruin_air_bridge_request(uint8_t command)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (command == RUIN_AIR_RELEASE_COMMAND) {
+        return schedule_release(1);
+    }
+
     static const uint8_t manual_codes[] = {
         0x09, 0x0a, 0x07, 0x08, 0x0d, 0x0e, 0x0b, 0x0c,
         0x01, 0x02,
@@ -260,7 +291,7 @@ esp_err_t ruin_air_bridge_request(uint8_t command)
         esp_timer_stop(s_release_timer);
         ESP_RETURN_ON_ERROR(send_v1_frame(s_controller_mac, payload, sizeof(payload)),
                             TAG, "Manual command failed");
-        return esp_timer_start_once(s_release_timer, RUIN_RELEASE_DELAY_US);
+        return schedule_release(RUIN_RELEASE_DELAY_US);
     }
 
     if (command >= 10 && command <= 13) {
@@ -278,7 +309,7 @@ esp_err_t ruin_air_bridge_request(uint8_t command)
         esp_timer_stop(s_release_timer);
         ESP_RETURN_ON_ERROR(send_v1_frame(s_controller_mac, payload, sizeof(payload)),
                             TAG, "Axle command failed");
-        return esp_timer_start_once(s_release_timer, RUIN_RELEASE_DELAY_US);
+        return schedule_release(RUIN_RELEASE_DELAY_US);
     }
 
     if (command == 20 || command == 21) {
@@ -296,7 +327,7 @@ esp_err_t ruin_air_bridge_air_out(void)
     esp_timer_stop(s_release_timer);
     ESP_RETURN_ON_ERROR(send_v1_frame(s_controller_mac, payload, sizeof(payload)),
                         TAG, "Air out command failed");
-    return esp_timer_start_once(s_release_timer, RUIN_AIR_OUT_DELAY_US);
+    return schedule_release(RUIN_AIR_OUT_DELAY_US);
 }
 
 esp_err_t ruin_air_bridge_set_compressor(bool enabled, uint16_t on_psi, uint16_t off_psi)

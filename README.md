@@ -1,6 +1,6 @@
 # MackoDash Rotary Controller
 
-**Current firmware: 1.0**
+**Current firmware: 1.0.1**
 
 Standalone ESP-IDF 5.5 project for the Elecrow 1.28-inch ESP32-S3 rotary display.
 It is the optional controller add-on for MackoDash P4 firmware 3.0.0.

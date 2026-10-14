@@ -7,6 +7,8 @@
 
 #include "esp_err.h"
 
+#define RUIN_AIR_RELEASE_COMMAND 23
+
 typedef struct {
     bool connected;
     bool pressure_valid;
