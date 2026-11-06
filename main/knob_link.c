@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -21,6 +22,7 @@
 
 #define BIT_GOT_IP       BIT0
 #define BIT_DISCONNECTED BIT1
+#define DASH_SILENT_US   6000000   /* joined but no reply from the dash: start over */
 
 static const char *TAG = "knob_link";
 static EventGroupHandle_t s_events;
@@ -30,6 +32,7 @@ static volatile int s_sock = -1;
 static uint32_t s_gateway;
 static uint8_t s_last_bssid[6];
 static bool s_have_last_bssid;
+static volatile int64_t s_last_dash_rx_us;
 
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -68,7 +71,12 @@ static void save_last_dash(const uint8_t bssid[6])
 static bool find_dash(wifi_ap_record_t *best)
 {
     wifi_scan_config_t scan = {.show_hidden = false};
-    if (esp_wifi_scan_start(&scan, true) != ESP_OK) return false;
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "scan failed: %s", esp_err_to_name(err));
+        esp_wifi_disconnect();          /* a half-open connection blocks scanning */
+        return false;
+    }
     uint16_t count = 0;
     esp_wifi_scan_get_ap_num(&count);
     if (count == 0) return false;
@@ -148,13 +156,29 @@ static void link_task(void *arg)
         }
         save_last_dash(dash.bssid);
         open_socket();
+        s_last_dash_rx_us = esp_timer_get_time();
         s_up = s_sock >= 0;
         ESP_LOGI(TAG, "linked to %s", (char *)dash.ssid);
 
-        xEventGroupWaitBits(s_events, BIT_DISCONNECTED, pdTRUE, pdFALSE, portMAX_DELAY);
+        /* Stay until Wi-Fi drops or the dash goes quiet. The dash restarting
+           can leave the knob associated to a network that no longer answers
+           (its Wi-Fi chip restarts a few seconds after the dash itself). */
+        for (;;) {
+            EventBits_t bits = xEventGroupWaitBits(s_events, BIT_DISCONNECTED, pdTRUE, pdFALSE,
+                                                   pdMS_TO_TICKS(1000));
+            if (bits & BIT_DISCONNECTED) {
+                ESP_LOGI(TAG, "link lost (Wi-Fi), searching");
+                break;
+            }
+            if (esp_timer_get_time() - s_last_dash_rx_us > DASH_SILENT_US) {
+                ESP_LOGI(TAG, "dash silent, reconnecting");
+                esp_wifi_disconnect();
+                xEventGroupWaitBits(s_events, BIT_DISCONNECTED, pdTRUE, pdFALSE, pdMS_TO_TICKS(2000));
+                break;
+            }
+        }
         s_up = false;
         close_socket();
-        ESP_LOGI(TAG, "link lost, searching");
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -170,7 +194,10 @@ static void rx_task(void *arg)
             continue;
         }
         int n = recv(sock, buf, sizeof(buf), 0);
-        if (n > 0 && s_on_frame) s_on_frame(buf, (size_t)n);
+        if (n > 0) {
+            s_last_dash_rx_us = esp_timer_get_time();
+            if (s_on_frame) s_on_frame(buf, (size_t)n);
+        }
     }
 }
 
