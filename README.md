@@ -1,9 +1,9 @@
 # MackoDash Rotary Controller
 
-**Current firmware: 1.0.1**
+**Current firmware: 1.1.0**
 
 Standalone ESP-IDF 5.5 project for the Elecrow 1.28-inch ESP32-S3 rotary display.
-It is the optional controller add-on for MackoDash P4 firmware 3.0.0.
+It is the optional controller add-on for MackoDash P4 firmware 3.2.1 or newer.
 
 Open `MackoDash-Rotary.code-workspace` in VS Code to use the ESP32-S3 target and
 configure the controller's USB serial port without changing the ESP32-P4 dashboard
@@ -11,21 +11,24 @@ workspace. Use the ESP-IDF Build, Flash, and Monitor commands from that window.
 
 ## Controls
 
-- Rotate on Home: select View, Air Ride, Climate, Brightness, REC, Trip, Peaks,
-  Shift, or Logs.
-- Press on Home: open or run the selected dashboard action.
-- Rotate in an action: change the dashboard selection or value.
-- Press in an action: confirm.
-- Long press: request the page-specific secondary action or return Home.
-- Touch: return to Home.
+Home menu (turn to choose, press to open):
 
-The Air Ride page shows live pressure for all four corners and controls Ruin Air
-Management over ESP-NOW. The S3 remains the sole owner of Air Ride actuation;
-the P4 mirrors the controller page over UART.
+| Item | What it does |
+| --- | --- |
+| GAUGE | Live readout on the knob: boost, coolant, oil pressure/temp, AFR, intake, battery, fuel, knock, timing, injector duty, throttle. Turn to change. Stays on (no screensaver). |
+| VIEW | Pick the dash theme, press to apply. |
+| BRIGHT | Dash screen brightness. |
+| NIGHT | One press dims the dash, shift lights and knob; press again for day. |
+| REC | Start / stop data logging. |
+| TRIP | Odometer, Trip A and Trip B. Hold to reset a trip. |
+| PEAKS | Session peaks. Hold to reset all. |
 
-The status dot at the bottom is green while dashboard packets are arriving and
-red while disconnected. The controller remains usable for UI testing without a
-dashboard connection.
+- Press on a page: done / back to the menu.
+- Touch the screen: back to the menu.
+- Dash warnings appear on the knob automatically; press to dismiss.
+
+The ring around the edge shows the menu position, list position or the live
+value. The dot at the bottom is green while the dash link is up.
 
 ## Verified Pin Map
 

@@ -12,30 +12,13 @@
 #define ROTARY_MAX_PAYLOAD         64
 #define ROTARY_MAX_FRAME           (ROTARY_HEADER_SIZE + ROTARY_MAX_PAYLOAD + ROTARY_CRC_SIZE)
 
-#define ROTARY_CAPTURE_CHUNK_HEADER_SIZE 19
-#define ROTARY_CAPTURE_CHUNK_DATA_SIZE   (ROTARY_MAX_PAYLOAD - ROTARY_CAPTURE_CHUNK_HEADER_SIZE)
-#define ROTARY_CAPTURE_FLAG_FIRST        0x01
-#define ROTARY_CAPTURE_FLAG_LAST         0x02
-
 typedef enum {
     ROTARY_EVENT = 0x01,
     ROTARY_GET_STATE = 0x02,
     ROTARY_PING = 0x03,
-    ROTARY_CAPTURE_CONTROL = 0x10,
-    ROTARY_AIR_RIDE_COMMAND = 0x11,
-    ROTARY_HVAC_COMMAND = 0x12,
     ROTARY_STATE = 0x81,
     ROTARY_PONG = 0x83,
-    ROTARY_CAPTURE_CHUNK = 0x90,
-    ROTARY_CAPTURE_STATUS = 0x91,
-    ROTARY_AIR_RIDE_STATE = 0x92,
-    ROTARY_HVAC_STATE = 0x93,
 } rotary_message_type_t;
-
-typedef enum {
-    ROTARY_CAPTURE_STOP = 0,
-    ROTARY_CAPTURE_START = 1,
-} rotary_capture_command_t;
 
 typedef enum {
     ROTARY_OPEN = 0,
@@ -81,12 +64,6 @@ static inline void rotary_put_u32(uint8_t *data, uint32_t value)
     data[1] = (uint8_t)(value >> 8);
     data[2] = (uint8_t)(value >> 16);
     data[3] = (uint8_t)(value >> 24);
-}
-
-static inline void rotary_put_u64(uint8_t *data, uint64_t value)
-{
-    rotary_put_u32(data, (uint32_t)value);
-    rotary_put_u32(data + 4, (uint32_t)(value >> 32));
 }
 
 #endif
