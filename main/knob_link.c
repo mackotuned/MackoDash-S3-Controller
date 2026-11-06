@@ -213,3 +213,8 @@ bool knob_link_up(void)
 {
     return s_up;
 }
+
+uint32_t knob_link_gateway(void)
+{
+    return s_up ? s_gateway : 0;
+}

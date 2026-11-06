@@ -12,6 +12,8 @@
 #include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
+#include "esp_https_ota.h"
+#include "esp_ota_ops.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_io_interface.h"
 #include "esp_log.h"
@@ -112,6 +114,7 @@ typedef struct {
     bool saver;
     bool toast_active;
     toast_t toast;
+    int update_pct;          /* -1 unless installing an update from the dash */
 } render_key_t;
 
 static const char *TAG = "mackodash_rotary";
@@ -146,6 +149,8 @@ static bool s_toast_prev_flag;
 static int64_t s_toast_deadline;
 
 static uint8_t s_sequence;
+static volatile int s_update_pct = -1;
+static bool s_app_confirmed;
 
 /* ------------------------------------------------------------- link */
 
@@ -247,11 +252,82 @@ static void open_home_item(int index)
     send_event(ROTARY_OPEN, item->page);
 }
 
+/* ------------------------------------------------- update from the dash */
+
+typedef struct {
+    char url[64];
+} update_args_t;
+
+static void update_task(void *argument)
+{
+    update_args_t *args = (update_args_t *)argument;
+    ESP_LOGI(TAG, "updating from %s", args->url);
+    esp_http_client_config_t http = {.url = args->url, .timeout_ms = 15000, .buffer_size = 4096};
+    esp_https_ota_config_t config = {.http_config = &http};
+    esp_https_ota_handle_t ota = NULL;
+    esp_err_t err = esp_https_ota_begin(&config, &ota);
+    if (err == ESP_OK) {
+        esp_app_desc_t incoming;
+        if (esp_https_ota_get_img_desc(ota, &incoming) != ESP_OK ||
+                strcmp(incoming.project_name, esp_app_get_description()->project_name) != 0) {
+            err = ESP_ERR_INVALID_VERSION;
+        }
+    }
+    if (err == ESP_OK) {
+        int total = esp_https_ota_get_image_size(ota);
+        while ((err = esp_https_ota_perform(ota)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+            int read = esp_https_ota_get_image_len_read(ota);
+            if (total > 0) s_update_pct = read * 100 / total;
+        }
+        if (err == ESP_OK && !esp_https_ota_is_complete_data_received(ota)) err = ESP_FAIL;
+    }
+    if (err == ESP_OK) {
+        err = esp_https_ota_finish(ota);
+    } else if (ota) {
+        esp_https_ota_abort(ota);
+    }
+    free(args);
+    if (err == ESP_OK) {
+        s_update_pct = 100;
+        ESP_LOGI(TAG, "update installed, restarting");
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+    }
+    ESP_LOGW(TAG, "update failed: %s", esp_err_to_name(err));
+    s_update_pct = -1;
+    portENTER_CRITICAL(&s_state_lock);
+    toast_set_locked(KNOB_ICON_ALERT, KNOB_TONE_WARN, "UPDATE", "FAILED - TRY AGAIN");
+    portEXIT_CRITICAL(&s_state_lock);
+    vTaskDelete(NULL);
+}
+
+static void start_update(const uint8_t *payload, uint16_t length)
+{
+    if (length < 6 || s_update_pct >= 0) return;
+    uint32_t gateway = knob_link_gateway();
+    if (!gateway) return;
+    update_args_t *args = calloc(1, sizeof(*args));
+    if (!args) return;
+    const uint8_t *ip = (const uint8_t *)&gateway;
+    snprintf(args->url, sizeof(args->url), "http://%u.%u.%u.%u:%u/knob.bin", ip[0], ip[1], ip[2], ip[3],
+             (unsigned)rotary_get_u16(payload));
+    s_update_pct = 0;
+    /* internal-RAM stack (default): this task writes flash */
+    if (xTaskCreate(update_task, "knob_update", 8192, args, 5, NULL) != pdPASS) {
+        free(args);
+        s_update_pct = -1;
+    }
+}
+
 static void apply_frame(const uint8_t *frame, size_t frame_length)
 {
     uint16_t payload_length = rotary_get_u16(&frame[5]);
     if (frame_length != ROTARY_HEADER_SIZE + payload_length + ROTARY_CRC_SIZE) return;
     if (rotary_get_u16(&frame[frame_length - 2]) != rotary_crc16(frame, frame_length - 2)) return;
+    if (frame[3] == ROTARY_KNOB_UPDATE) {
+        start_update(&frame[ROTARY_HEADER_SIZE], payload_length);
+        return;
+    }
     if (frame[3] != ROTARY_STATE && frame[3] != ROTARY_PONG) return;
     int64_t now = esp_timer_get_time();
     if (frame[3] == ROTARY_PONG) {
@@ -368,6 +444,19 @@ static void build_view(render_key_t *key, knob_view_t *v, char *parts_buffer, ch
     v->linked = key->linked;
     v->recording = st->recording;
     v->level_permille = -1;
+
+    if (key->update_pct >= 0) {
+        snprintf(parts_buffer, sizeof(key->state.label), "%d", key->update_pct);
+        v->screen = KNOB_SCREEN_LEVEL;
+        v->ring = KNOB_RING_LEVEL;
+        v->level_permille = key->update_pct * 10;
+        v->caption = "UPDATING KNOB";
+        v->value = parts_buffer;
+        v->unit = "PERCENT";
+        v->hint = "KEEP THE DASH ON";
+        v->hint_accent = true;
+        return;
+    }
 
     if (key->toast_active) {
         v->screen = KNOB_SCREEN_MESSAGE;
@@ -502,7 +591,8 @@ static void ui_task(void *argument)
         key.linked = linked;
         key.toast_active = now < s_toast_until;
         if (key.toast_active) key.toast = s_toast;
-        key.saver = !key.toast_active && !page_keeps_screen_on(s_state.page) &&
+        key.update_pct = s_update_pct;
+        key.saver = !key.toast_active && key.update_pct < 0 && !page_keeps_screen_on(s_state.page) &&
                     now - s_last_activity >= SCREENSAVER_TIMEOUT_US;
         portEXIT_CRITICAL(&s_state_lock);
 
@@ -673,6 +763,23 @@ static void communication_task(void *argument)
             send_frame(ROTARY_PING, (const uint8_t *)version, (uint16_t)strnlen(version, 23));
         }
         else if (fast || tick % 5 == 0) send_frame(ROTARY_GET_STATE, NULL, 0);
+        /* A freshly installed version keeps itself once it has reached the dash
+           (or has simply run for a minute); otherwise the next power-up goes
+           back to the previous version. */
+        if (!s_app_confirmed) {
+            portENTER_CRITICAL(&s_state_lock);
+            bool linked = link_connected_locked(esp_timer_get_time());
+            portEXIT_CRITICAL(&s_state_lock);
+            if (linked || esp_timer_get_time() > 60LL * 1000 * 1000) {
+                s_app_confirmed = true;
+                esp_ota_img_states_t state;
+                const esp_partition_t *running = esp_ota_get_running_partition();
+                if (esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY) {
+                    ESP_LOGI(TAG, "new version confirmed");
+                    esp_ota_mark_app_valid_cancel_rollback();
+                }
+            }
+        }
         ++tick;
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -852,8 +959,39 @@ static void peripherals_init(void)
     ESP_ERROR_CHECK(uart_driver_install(LINK_UART, 512, 0, 0, NULL, 0));
 }
 
+/* The USB updater writes the knob app to the first slot (0x10000) but leaves
+   the slot selection alone. After a wireless update the knob runs from the
+   second slot, so a later USB update would be ignored. If the other slot holds
+   a newer, valid knob app, switch to it. */
+static int version_cmp(const char *a, const char *b)
+{
+    int va[3] = {0}, vb[3] = {0};
+    sscanf(a, "%d.%d.%d", &va[0], &va[1], &va[2]);
+    sscanf(b, "%d.%d.%d", &vb[0], &vb[1], &vb[2]);
+    for (int i = 0; i < 3; ++i) {
+        if (va[i] != vb[i]) return va[i] < vb[i] ? -1 : 1;
+    }
+    return 0;
+}
+
+static void boot_newest_slot(void)
+{
+    const esp_app_desc_t *mine = esp_app_get_description();
+    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+    esp_app_desc_t theirs;
+    if (!other || esp_ota_get_partition_description(other, &theirs) != ESP_OK) return;
+    if (strcmp(theirs.project_name, mine->project_name) != 0) return;
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(other, &state) == ESP_OK &&
+            (state == ESP_OTA_IMG_INVALID || state == ESP_OTA_IMG_ABORTED)) return;
+    if (version_cmp(theirs.version, mine->version) <= 0) return;
+    ESP_LOGI(TAG, "newer knob app %s in %s, switching to it", theirs.version, other->label);
+    if (esp_ota_set_boot_partition(other) == ESP_OK) esp_restart();   /* validates the image first */
+}
+
 void app_main(void)
 {
+    boot_newest_slot();
     s_lcd_done = xSemaphoreCreateBinary();
     s_uart_tx_mutex = xSemaphoreCreateMutex();
     s_encoder_queue = xQueueCreate(64, sizeof(uint8_t));

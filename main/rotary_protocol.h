@@ -18,6 +18,7 @@ typedef enum {
     ROTARY_PING = 0x03,
     ROTARY_STATE = 0x81,
     ROTARY_PONG = 0x83,
+    ROTARY_KNOB_UPDATE = 0x84,   /* dash -> knob: new firmware ready (u16 port, u32 size, version) */
 } rotary_message_type_t;
 
 typedef enum {
