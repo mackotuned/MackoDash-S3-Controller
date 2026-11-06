@@ -9,6 +9,7 @@
 #include "driver/ledc.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_io.h"
@@ -20,6 +21,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "honda_emblem.h"
+#include "knob_link.h"
 #include "knob_ui.h"
 #include "rotary_protocol.h"
 
@@ -161,7 +163,10 @@ static void send_frame(rotary_message_type_t type, const uint8_t *payload, uint1
     if (length) memcpy(&frame[ROTARY_HEADER_SIZE], payload, length);
     size_t crc_offset = ROTARY_HEADER_SIZE + length;
     rotary_put_u16(&frame[crc_offset], rotary_crc16(frame, crc_offset));
-    uart_write_bytes(LINK_UART, frame, crc_offset + ROTARY_CRC_SIZE);
+    /* wireless when linked to a dash, otherwise the cable */
+    if (!knob_link_send(frame, crc_offset + ROTARY_CRC_SIZE)) {
+        uart_write_bytes(LINK_UART, frame, crc_offset + ROTARY_CRC_SIZE);
+    }
     xSemaphoreGive(s_uart_tx_mutex);
 }
 
@@ -221,7 +226,7 @@ static void open_home_item(int index)
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_state_lock);
     if (!link_connected_locked(now)) {
-        toast_set_locked(KNOB_ICON_LINK, KNOB_TONE_NORMAL, "NO DASH LINK", "CHECK KNOB CABLE");
+        toast_set_locked(KNOB_ICON_LINK, KNOB_TONE_NORMAL, "NO DASH LINK", "WAITING FOR DASH");
         portEXIT_CRITICAL(&s_state_lock);
         return;
     }
@@ -662,7 +667,11 @@ static void communication_task(void *argument)
         portENTER_CRITICAL(&s_state_lock);
         bool fast = s_state.page == PAGE_GAUGE;
         portEXIT_CRITICAL(&s_state_lock);
-        if (tick % 20 == 0) send_frame(ROTARY_PING, NULL, 0);
+        if (tick % 20 == 0) {
+            /* the PING carries this knob's firmware version for the dash's Knob page */
+            const char *version = esp_app_get_description()->version;
+            send_frame(ROTARY_PING, (const uint8_t *)version, (uint16_t)strnlen(version, 23));
+        }
         else if (fast || tick % 5 == 0) send_frame(ROTARY_GET_STATE, NULL, 0);
         ++tick;
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -853,6 +862,7 @@ void app_main(void)
                     ESP_OK : ESP_ERR_NO_MEM);
     lcd_init();
     peripherals_init();
+    knob_link_start(apply_frame);
     s_last_activity = esp_timer_get_time();
     ESP_LOGI(TAG, "MackoDash rotary controller started");
     xTaskCreate(uart_task, "rotary_uart", 4096, NULL, 6, NULL);

@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size
+# ota_0 stays at 0x10000, where the MackoDash USB updater writes the knob app.
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+ota_0,    app,  ota_0,   0x10000, 0x300000,
+ota_1,    app,  ota_1,   ,        0x300000,
