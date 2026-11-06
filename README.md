@@ -30,8 +30,8 @@ Home menu (turn to choose, press to open):
 
 | Item | What it does |
 | --- | --- |
-| GAUGE | Live readout on the knob: boost, coolant, oil pressure/temp, AFR, intake, battery, fuel, knock, timing, injector duty, throttle. Turn to change. Stays on (no screensaver). |
-| VIEW | Pick the dash theme, press to apply. |
+| GAUGE | Live readout on the knob: boost, coolant, oil pressure/temp, AFR, intake, battery, fuel, knock, timing, injector duty, throttle. Turn to change. Stays open until you leave it. |
+| VIEW | Turn to switch the dash theme live; press to keep it. Leaving without a press puts the old theme back. |
 | BRIGHT | Dash screen brightness. |
 | NIGHT | One press dims the dash, shift lights and knob; press again for day. |
 | REC | Start / stop data logging. |
@@ -40,6 +40,7 @@ Home menu (turn to choose, press to open):
 
 - Press on a page: done / back to the menu.
 - Touch the screen: back to the menu.
+- Any page except GAUGE goes back to the menu after 30 seconds without input.
 - Dash warnings appear on the knob automatically; press to dismiss.
 
 The ring around the edge shows the menu position, list position or the live

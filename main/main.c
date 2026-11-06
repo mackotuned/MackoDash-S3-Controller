@@ -22,7 +22,6 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "honda_emblem.h"
 #include "knob_link.h"
 #include "knob_ui.h"
 #include "rotary_protocol.h"
@@ -50,7 +49,7 @@
 #define LINK_RX_GPIO 44
 #define LINK_BAUD 115200
 #define CST816_ADDRESS 0x15
-#define SCREENSAVER_TIMEOUT_US (60LL * 1000 * 1000)
+#define IDLE_HOME_US (30LL * 1000 * 1000)   /* any page goes back home after 30 s without input */
 #define LINK_TIMEOUT_US 2500000
 #define TOAST_US 1400000
 #define TOAST_WAIT_US 700000
@@ -111,7 +110,6 @@ typedef struct {
     controller_state_t state;
     int home_selection;
     bool linked;
-    bool saver;
     bool toast_active;
     toast_t toast;
     int update_pct;          /* -1 unless installing an update from the dash */
@@ -388,41 +386,23 @@ static void parser_push(frame_parser_t *parser, uint8_t byte)
 
 /* ------------------------------------------------------------ screen */
 
-static bool page_keeps_screen_on(controller_page_t page)
+/* The live gauge readout and dash warnings stay up; every other page
+   returns home after IDLE_HOME_US without input. */
+static bool page_stays_open(controller_page_t page)
 {
     return page == PAGE_GAUGE || page == PAGE_ALERT;
 }
 
+/* Records user input (restarts the idle timer). Kept as a bool so the input
+   code can still swallow a wake-up action if a screen-off mode returns. */
 static bool wake_screen(void)
 {
-    int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_state_lock);
-    bool was_saver = now - s_last_activity >= SCREENSAVER_TIMEOUT_US &&
-                     !page_keeps_screen_on(s_state.page);
-    s_last_activity = now;
+    s_last_activity = esp_timer_get_time();
     portEXIT_CRITICAL(&s_state_lock);
-    return was_saver;
+    return false;
 }
 
-static void draw_screensaver(void)
-{
-    const uint16_t background = RGB565(7, 8, 10);
-    const uint16_t colors[4] = {
-        background, RGB565(81, 6, 21), RGB565(154, 3, 32), RGB565(228, 0, 43),
-    };
-    uint16_t bg = (uint16_t)((background << 8) | (background >> 8));
-    for (int i = 0; i < LCD_WIDTH * LCD_HEIGHT; ++i) s_framebuffer[i] = bg;
-    int x0 = 120 - HONDA_EMBLEM_WIDTH / 2, y0 = 115 - HONDA_EMBLEM_HEIGHT / 2;
-    for (int row = 0; row < HONDA_EMBLEM_HEIGHT; ++row) {
-        for (int col = 0; col < HONDA_EMBLEM_WIDTH; ++col) {
-            size_t index = (size_t)row * HONDA_EMBLEM_WIDTH + col;
-            uint8_t alpha = (honda_emblem_alpha[index >> 2] >> (6 - (index & 3) * 2)) & 0x03;
-            if (!alpha) continue;
-            uint16_t c = colors[alpha];
-            s_framebuffer[(y0 + row) * LCD_WIDTH + x0 + col] = (uint16_t)((c << 8) | (c >> 8));
-        }
-    }
-}
 
 /* Splits "CAPTION|VALUE|UNIT"; missing parts become empty strings. */
 static void split_label(char *label, char **parts, int count)
@@ -549,7 +529,7 @@ static void build_view(render_key_t *key, knob_view_t *v, char *parts_buffer, ch
         v->count = st->count;
         v->caption = st->page == PAGE_VIEW ? "DASH THEME" : NULL;
         v->name = parts[0][0] ? parts[0] : "...";
-        v->hint = st->page == PAGE_VIEW ? "PRESS TO APPLY" : "PRESS FOR HOME";
+        v->hint = st->page == PAGE_VIEW ? "PRESS TO KEEP" : "PRESS FOR HOME";
         break;
     }
 }
@@ -592,9 +572,17 @@ static void ui_task(void *argument)
         key.toast_active = now < s_toast_until;
         if (key.toast_active) key.toast = s_toast;
         key.update_pct = s_update_pct;
-        key.saver = !key.toast_active && key.update_pct < 0 && !page_keeps_screen_on(s_state.page) &&
-                    now - s_last_activity >= SCREENSAVER_TIMEOUT_US;
+        bool idle_home = linked && s_state.page != PAGE_HOME && !page_stays_open(s_state.page) &&
+                         s_toast_pending == PAGE_HOME && now - s_last_activity >= IDLE_HOME_US;
         portEXIT_CRITICAL(&s_state_lock);
+        if (idle_home) {
+            /* nothing chosen for a while: back to the menu (VIEW puts the old theme back) */
+            go_home_locally();
+            send_event(ROTARY_BACK, 0);
+            portENTER_CRITICAL(&s_state_lock);
+            key.state = s_state;
+            portEXIT_CRITICAL(&s_state_lock);
+        }
 
         int wanted = key.state.night ? BACKLIGHT_NIGHT : BACKLIGHT_DAY;
         if (wanted != backlight) {
@@ -603,15 +591,11 @@ static void ui_task(void *argument)
         }
 
         if (!have_last || memcmp(&key, &last, sizeof(key)) != 0) {
-            if (key.saver) {
-                draw_screensaver();
-            } else {
-                knob_view_t view;
-                char parts_buffer[sizeof(key.state.label)];
-                char *parts[3];
-                build_view(&key, &view, parts_buffer, parts);
-                knob_ui_render(s_framebuffer, &view);
-            }
+            knob_view_t view;
+            char parts_buffer[sizeof(key.state.label)];
+            char *parts[3];
+            build_view(&key, &view, parts_buffer, parts);
+            knob_ui_render(s_framebuffer, &view);
             lcd_transmit();
             last = key;
             have_last = true;
